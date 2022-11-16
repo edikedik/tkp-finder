@@ -33,7 +33,7 @@ The interface has two commands:
 
 The `setup` command will download and prepare HMM models for annotation.
 
-```bash
+```
 → tkp-finder setup --help
 
 Usage: tkp-finder setup [OPTIONS]
@@ -56,14 +56,14 @@ Options:
 
 For the first-time usage, invoke
 
-```bash
+```
 → tkp-finder setup -H hmm -d
 ```
 
 This will download Pfam-A HMMs and accompanying metadata, and split the models into categories.
 The resulting directory:
 
-```bash
+```
 → tree -L 2 hmm
 
 hmm
@@ -83,7 +83,7 @@ hmm
 
 To dicover and annotate TKPs, refer to `tkp-finder find` command:
 
-```bash
+```
 → tkp-finder find --help
 
 Usage: tkp-finder find [OPTIONS] [FASTA]...
@@ -118,5 +118,7 @@ Options:
                              a PK domain.  [default: 150]
   --min_domains INTEGER      The number of domains to classify a protein as
                              TKP.
+  --timeout INTEGER          For parallel processing, indicate timeout for
+                             getting results of a single process.
   -h, --help                 Show this message and exit.
 ```

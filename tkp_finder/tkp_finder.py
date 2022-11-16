@@ -235,9 +235,13 @@ def parse_pfam_dat(path: Path):
     '--min_domains', type=int, default=2,
     help='The number of domains to classify a protein as TKP.'
 )
+@click.option(
+    '--timeout', type=int, default=300,
+    help='For parallel processing, indicate timeout for getting results '
+         'of a single process.')
 def find(
         fasta, hmm_dir, hmm_type, pk_profile, motif, output, num_proc, quiet,
-        pk_map_name, ppk_map_name, min_domain_size, min_domains
+        pk_map_name, ppk_map_name, min_domain_size, min_domains, timeout
 ):
     if not quiet:
         LOGGER.setLevel(logging.INFO)
@@ -283,7 +287,7 @@ def find(
 
     if use_parallel:
         LOGGER.info(f'Processing {len(fasta)} files in parallel')
-        results = yield_parallel(pipe_one, num_proc, fasta)
+        results = yield_parallel(pipe_one, num_proc, fasta, timeout)
     else:
         results = yield_sequentially(pipe_one, fasta)
 
@@ -486,12 +490,12 @@ def yield_sequentially(fn, *args):
     yield from map(fn, *args)
 
 
-def yield_parallel(fn, num_proc, objs):
+def yield_parallel(fn, num_proc, objs, timeout=500):
     with ProcessPoolExecutor(num_proc) as executor:
         futures = [(o, executor.submit(fn, o)) for o in objs]
         for o, f in futures:
             try:
-                yield f.result()
+                yield f.result(timeout=timeout)
             except Exception as e:
                 LOGGER.error(f'Failed on input {o} with {e}; stacktrace below')
                 LOGGER.exception(e)
