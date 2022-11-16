@@ -51,11 +51,20 @@ LOGGER.addHandler(handler)
         help_option_names=['-h', '--help'],
         ignore_unknown_options=True
     ),
+    no_args_is_help=True,
     invoke_without_command=True)
-def tkp_finder(): ...
+def tkp_finder():
+    """
+    The command-line tool to discover and annotate tandem protein kinases.
+
+    It's based on the [lXtractor](https://github.com/edikedik/lXtractor) library.
+
+    Author: Ivan Reveguk <ivan.reveguk@gmail.com>
+    """
+    pass
 
 
-@tkp_finder.command('setup')
+@tkp_finder.command('setup', no_args_is_help=True)
 @click.option(
     '-H', '--hmm_dir', required=True,
     type=click.Path(dir_okay=True, file_okay=False, writable=True),
@@ -82,6 +91,8 @@ def tkp_finder(): ...
 def setup(hmm_dir, download, quiet, path_pfam_a, path_pfam_dat):
     """
     Command to initialize the HMM data needed for TKPs' annotation.
+
+    For a fist-time usage, invoke `tkp-finder setup -H hmm -d`.
     """
     if not quiet:
         LOGGER.setLevel(logging.INFO)
@@ -181,7 +192,7 @@ def parse_pfam_dat(path: Path):
             columns=['ID', 'Accession', 'Description', 'Type'])
 
 
-@tkp_finder.command('find', context_settings={"ignore_unknown_options": True})
+@tkp_finder.command('find', context_settings={"ignore_unknown_options": True}, no_args_is_help=True)
 @click.argument('fasta', nargs=-1, type=click.Path())
 @click.option(
     '-H', '--hmm_dir', type=click.Path(exists=True, dir_okay=True, file_okay=False),
@@ -243,6 +254,16 @@ def find(
         fasta, hmm_dir, hmm_type, pk_profile, motif, output, num_proc, quiet,
         pk_map_name, ppk_map_name, min_domain_size, min_domains, timeout
 ):
+    """
+    The command finds TKPs in a list of input fasta files.
+
+    It first discovers proteins with `>=min_domains` PK domains.
+    For these proteins, it uses Pfam-A profiles separated into categories (see `hmm_type` option)
+    to produce non-overlapping annotations within each hmm type (maximizing the cumulative BitScore).
+
+    All the extracted profiles are saved as a nested collection of files.
+    Additionally, for each input fasta, it produces the aggregated `summary.tsv`.
+    """
     if not quiet:
         LOGGER.setLevel(logging.INFO)
     fasta = [Path(f) for f in fasta]
@@ -324,7 +345,7 @@ def find_tkps(
         curry(read_fasta)(strip_id=True),
         curry(unique_everseen)(key=op.itemgetter(1)),
         initializer.from_iterable,
-        # wrap_pbar,
+        wrap_pbar,
         ChainList
     )
 
@@ -333,7 +354,7 @@ def find_tkps(
     return pipe(
         chains,
         lambda x: x.filter(lambda c: len(c.children) >= min_domains),
-        filter_child_overlaps,
+        filter_child_overlaps(quiet=quiet),
         lambda x: x.filter(lambda c: len(c.children) >= min_domains),
     )
 
@@ -369,10 +390,13 @@ def filter_child_overlaps(
         chains: ChainList,
         filt_fn: abc.Callable[[ChainSequence], bool] = lambda _: True,
         val_fn: abc.Callable[[ChainSequence], float] = len,
+        quiet: bool = True
 ) -> ChainList:
-    for c in chains:
+    _chains = chains if quiet else tqdm(chains, desc='Resolving overlaps')
+    for c in _chains:
         target_children = filter(filt_fn, next(c.iter_children()))
-        non_overlapping = resolve_overlaps(target_children, value_fn=val_fn)
+        non_overlapping = resolve_overlaps(
+            target_children, value_fn=val_fn, max_it=int(10**7), verbose=not quiet)
         non_overlapping_ids = [x.id for x in non_overlapping]
         c.children = valfilter(
             lambda x: not filt_fn(x) or x.id in non_overlapping_ids, c.children)
@@ -452,12 +476,13 @@ def discover_and_annotate(
         hmms = list((hmm_base_dir / hmm_type).glob('*hmm'))
         return pipe(
             chains,
-            annotate_by_hmms(hmm_paths=hmms, hmm_type=hmm_type),
+            annotate_by_hmms(hmm_paths=hmms, hmm_type=hmm_type, quiet=quiet),
             filter_child_overlaps(
                 filt_fn=lambda c: any(
                     (x.startswith(hmm_type) for x in c.fields)
                 ),
-                val_fn=value_fn(hmm_type=hmm_type)
+                val_fn=value_fn(hmm_type=hmm_type),
+                quiet=quiet
             )
         )
 
