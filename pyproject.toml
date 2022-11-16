@@ -10,17 +10,22 @@ requires-python = ">=3.10"
 license = "MIT"
 keywords = []
 authors = [
-  { name = "Ivan Reveguk", email = "edikedikedikedik@gmail.com" },
+    { name = "Ivan Reveguk", email = "edikedikedikedik@gmail.com" },
 ]
 classifiers = [
-  "Development Status :: 4 - Beta",
-  "Programming Language :: Python",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: Implementation :: CPython",
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: Implementation :: CPython",
 ]
 dependencies = [
-  "lXtractor"
+    "click>=8.1.3",
+    "more-itertools>=9.0",
+    "toolz>=0.12",
+    "tqdm>=4.64",
+    "pandas>=1.5",
+    "lXtractor"
 ]
 dynamic = ["version"]
 
@@ -34,8 +39,8 @@ path = "tkp_finder/__about__.py"
 
 [tool.hatch.envs.default]
 dependencies = [
-  "pytest",
-  "pytest-cov",
+    "pytest",
+    "pytest-cov",
 ]
 [tool.hatch.envs.default.scripts]
 cov = "pytest --cov-report=term-missing --cov-config=pyproject.toml --cov=tkp_finder --cov=tests {args}"
@@ -48,12 +53,15 @@ python = ["310", "311"]
 branch = true
 parallel = true
 omit = [
-  "tkp_finder/__about__.py",
+    "tkp_finder/__about__.py",
 ]
 
 [tool.coverage.report]
 exclude_lines = [
-  "no cov",
-  "if __name__ == .__main__.:",
-  "if TYPE_CHECKING:",
+    "no cov",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
 ]
+
+[project.scripts]
+tkp-finder = "tkp_finder.tkp_finder:tkp_finder"
