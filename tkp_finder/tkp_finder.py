@@ -36,13 +36,18 @@ VARIABLES = (
     SeqEl(121), SeqEl(122), SeqEl(123),  # HRD
     SeqEl(141), SeqEl(142), SeqEl(143),  # DFG
 )
-MOTIF = 'KEXXDDXX'
+MOTIF = 'KXXXDDXX'
 
 LOGGER = logging.getLogger(__name__)
 handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 LOGGER.addHandler(handler)
+
+# TODO: filter all annotations by profile coverage
+# TODO: Min score option for all HMMs
+# TODO: Second aggregation in a human-readable format: LEVEL ...-x-(start-N-end)-x-...
+# TODO: add TM option prediction
 
 
 @click.group(
@@ -59,6 +64,7 @@ def tkp_finder():
 
     It's based on the [lXtractor](https://github.com/edikedik/lXtractor) library.
 
+    GitHub: <https://github.com/edikedik/tkp-finder>
     Author: Ivan Reveguk <ivan.reveguk@gmail.com>
     """
     pass
@@ -222,15 +228,6 @@ def parse_pfam_dat(path: Path):
     help='Output directory to store the results. Be default, will store within `./tkp-finder`.'
 )
 @click.option(
-    '-n', '--num_proc', type=int, default=None,
-    help='The number of cpus for data parallelism: each input fasta will be annotated within '
-         'separate process. HINT: one may split large fasta files for faster processing.'
-)
-@click.option(
-    '-q', '--quiet', is_flag=True, default=False,
-    help='Disable logging and progress bar'
-)
-@click.option(
     '--pk_map_name', default=PK_NAME, show_default=True,
     help='Use this name for the protein kinase domain.'
 )
@@ -239,20 +236,39 @@ def parse_pfam_dat(path: Path):
     help='Use this name for pseudo protein kinases.'
 )
 @click.option(
-    '--min_domain_size', type=int, default=150, show_default=True,
+    '-ms', '--min_pk_domain_size', type=int, default=150, show_default=True,
     help='The minimum number of amino acid residues within a PK domain.'
 )
 @click.option(
-    '--min_domains', type=int, default=2,
+    '--min_pk_domains', type=int, default=2,
     help='The number of domains to classify a protein as TKP.'
+)
+@click.option(
+    '-mS', '--min_hmm_score', type=float, default=0.0, show_default=True,
+    help='Min BitScore of a domain.',
+)
+@click.option(
+    '-mc', '--min_hmm_cov', type=float, default=0.5, show_default=True,
+    help='Min coverage by an HMM profile.'
 )
 @click.option(
     '--timeout', type=int, default=300,
     help='For parallel processing, indicate timeout for getting results '
          'of a single process.')
+@click.option(
+    '-n', '--num_proc', type=int, default=None,
+    help='The number of cpus for data parallelism: each input fasta will be annotated within '
+         'separate process. HINT: one may split large fasta files for faster processing.'
+)
+@click.option(
+    '-q', '--quiet', is_flag=True, default=False,
+    help='Disable logging and progress bar'
+)
 def find(
-        fasta, hmm_dir, hmm_type, pk_profile, motif, output, num_proc, quiet,
-        pk_map_name, ppk_map_name, min_domain_size, min_domains, timeout
+        fasta, hmm_dir, hmm_type, pk_profile, motif, output,
+        pk_map_name, ppk_map_name, min_pk_domain_size, min_pk_domains,
+        min_hmm_score, min_hmm_cov,
+        timeout, num_proc, quiet,
 ):
     """
     The command finds TKPs in a list of input fasta files.
@@ -297,8 +313,10 @@ def find(
         pk_profile=pk_profile,
         hmm_base_dir=hmm_dir / 'profiles',
         hmm_types=hmm_type,
-        min_size=min_domain_size,
-        min_domains=min_domains,
+        min_pk_domain_size=min_pk_domain_size,
+        min_pk_domains=min_pk_domains,
+        min_hmm_score=min_hmm_score,
+        min_hmm_cov=min_hmm_cov,
         motif=motif,
         pk_map_name=pk_map_name,
         ppk_name=ppk_map_name,
@@ -329,8 +347,8 @@ def find(
 
 @curry
 def find_tkps(
-        path: Path, profile: Path, min_size: int = 150,
-        min_domains: int = 2, map_name: str = PK_NAME, quiet: bool = True
+        path: Path, profile: Path, min_size: int = 150, min_domains: int = 2,
+        map_name: str = PK_NAME, quiet: bool = True
 ) -> ChainList:
     def wrap_pbar(it):
         if quiet:
@@ -374,14 +392,17 @@ def calculate_variables(
 @curry
 def annotate_by_hmms(
         chains: ChainList, hmm_paths: abc.Iterable[Path], hmm_type: str,
-        quiet: bool = True
+        min_size: int | None = None, min_score: float | None = None,
+        min_cov: float | None = None, quiet: bool = True,
 ) -> ChainList:
     if not quiet:
         hmm_paths = tqdm(hmm_paths, desc=f'Annotating by HMM {hmm_type}')
     for path in hmm_paths:
         map_name = f'{hmm_type}_{path.stem}'
         annotator = PyHMMer(path, bit_cutoffs='trusted')
-        consume(annotator.annotate(chains, new_map_name=map_name))
+        consume(annotator.annotate(
+            chains, new_map_name=map_name,
+            min_size=min_size, min_score=min_score, min_cov=min_cov))
     return chains
 
 
@@ -455,7 +476,8 @@ def aggregate_annotations(
 def discover_and_annotate(
         path: Path, pk_profile: Path, hmm_base_dir: Path,
         hmm_types: abc.Iterable[str] = ('Family', 'Domain', 'Motif'),
-        min_size: int = 150, min_domains: int = 2, motif=MOTIF,
+        min_pk_domain_size: int = 150, min_pk_domains: int = 2,
+        min_hmm_score: float = 0, min_hmm_cov: float = 0.5, motif=MOTIF,
         pk_map_name: str = PK_NAME, ppk_name: str = PPK_NAME,
         seq_variables: abc.Sequence[SequenceVariable] = VARIABLES,
         quiet: bool = True,
@@ -476,7 +498,10 @@ def discover_and_annotate(
         hmms = list((hmm_base_dir / hmm_type).glob('*hmm'))
         return pipe(
             chains,
-            annotate_by_hmms(hmm_paths=hmms, hmm_type=hmm_type, quiet=quiet),
+            annotate_by_hmms(
+                hmm_paths=hmms, hmm_type=hmm_type,
+                min_score=min_hmm_score, min_cov=min_hmm_cov,
+                quiet=quiet),
             filter_child_overlaps(
                 filt_fn=lambda c: any(
                     (x.startswith(hmm_type) for x in c.fields)
@@ -491,7 +516,7 @@ def discover_and_annotate(
 
     chains = find_tkps(
         path,
-        min_size=min_size, min_domains=min_domains,
+        min_size=min_pk_domain_size, min_domains=min_pk_domains,
         map_name=pk_map_name, profile=pk_profile, quiet=quiet
     )
     if len(chains) == 0:
