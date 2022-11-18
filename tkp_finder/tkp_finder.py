@@ -18,14 +18,16 @@ from lXtractor.variables.base import SequenceVariable
 from lXtractor.variables.manager import Manager
 from lXtractor.variables.sequential import SeqEl
 from more_itertools import consume, unique_everseen, split_at, zip_equal
-from pyhmmer.plan7 import HMMFile
+from pyhmmer.plan7 import HMMFile, HMM
 from toolz import keyfilter, valfilter, compose_left, pipe, curry
 from tqdm.auto import tqdm
 
 PFAM_A_URL = "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.gz"
 PFAM_DAT_URL = "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.dat.gz"
+PLANT_HMM_URL = "https://raw.githubusercontent.com/edikedik/tkp-finder/master/Appendix_4/Plant_Pkinase_fam.hmm"
 PFAM_A_NAME = 'Pfam-A.hmm'
 PFAM_DAT_NAME = 'Pfam-A.hmm.dat'
+PLANT_HMM_NAME = 'Plant_Pkinase_fam.hmm'
 PFAM_PK_NAME = 'PF00069'
 PK_NAME = 'PK'
 PPK_NAME = 'PPK'
@@ -44,8 +46,7 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 LOGGER.addHandler(handler)
 
-# TODO: filter all annotations by profile coverage
-# TODO: Min score option for all HMMs
+
 # TODO: Second aggregation in a human-readable format: LEVEL ...-x-(start-N-end)-x-...
 # TODO: add TM option prediction
 
@@ -60,7 +61,7 @@ LOGGER.addHandler(handler)
     invoke_without_command=True)
 def tkp_finder():
     """
-    The command-line tool to discover and annotate tandem protein kinases.
+    A command-line tool to discover and annotate tandem protein kinases.
 
     It's based on the [lXtractor](https://github.com/edikedik/lXtractor) library.
 
@@ -72,13 +73,17 @@ def tkp_finder():
 
 @tkp_finder.command('setup', no_args_is_help=True)
 @click.option(
-    '-H', '--hmm_dir', required=True,
-    type=click.Path(dir_okay=True, file_okay=False, writable=True),
-    help='Path to a directory to store hmm-related data.'
+    '-H', '--hmm_dir', type=click.Path(dir_okay=True, file_okay=False, writable=True),
+    help='Path to a directory to store hmm-related data. By default, will create an `hmm` '
+         'dir in the current directory.'
 )
 @click.option(
     '-d', '--download', is_flag=True, default=False, show_default=True,
-    help='If True, download the Pfam data from interpro.'
+    help='If the flag is on, download the Pfam data from interpro.'
+)
+@click.option(
+    '-p', '--plants', is_flag=True, default=False, show_default=True,
+    help='If the flag is on, use Plant PK family-type HMMs.'
 )
 @click.option(
     '-q', '--quiet', is_flag=True, default=False, show_default=True,
@@ -94,7 +99,12 @@ def tkp_finder():
     help='A path to downloaded Pfam-A (meta)data file. By default, if `download` is ``False``,'
          'will try to find it within the `hmm_dir`.'
 )
-def setup(hmm_dir, download, quiet, path_pfam_a, path_pfam_dat):
+@click.option(
+    '--path_plants', type=click.Path(dir_okay=False, file_okay=True, exists=True),
+    help='A path to downloaded Plant HMMs. By default, if `download` is ``False``,'
+         'will try to find it within the `hmm_dir`.'
+)
+def setup(hmm_dir, download, plants, quiet, path_pfam_a, path_pfam_dat, path_plants):
     """
     Command to initialize the HMM data needed for TKPs' annotation.
 
@@ -103,7 +113,7 @@ def setup(hmm_dir, download, quiet, path_pfam_a, path_pfam_dat):
     if not quiet:
         LOGGER.setLevel(logging.INFO)
 
-    hmm_dir = Path(hmm_dir)
+    hmm_dir = Path.cwd() / 'hmm' if hmm_dir is None else Path(hmm_dir)
     hmm_dir.mkdir(exist_ok=True, parents=True)
 
     if download:
@@ -129,38 +139,41 @@ def setup(hmm_dir, download, quiet, path_pfam_a, path_pfam_dat):
     df.to_csv(hmm_dir / 'pfam_entries.tsv', sep='\t', index=False)
     LOGGER.info(f'Obtained {len(df)} metadata entries from {path_pfam_dat}')
 
-    with HMMFile(path_pfam_a) as f:
-        hmms = list(f)
-    LOGGER.info(f'Obtained {len(hmms)} profiles from {path_pfam_a}')
-
     acc2type = {
         dom_id: dom_type for dom_id, dom_type in
         df[['Accession', 'Type']].itertuples(index=False)
     }
 
-    profiles_dir = hmm_dir / 'profiles'
-    type_dirs = {x: (profiles_dir / x) for x in df['Type'].unique()}
-    type_dirs[UNK_HMM] = profiles_dir / UNK_HMM
-    for d in type_dirs.values():
-        d.mkdir(exist_ok=True, parents=True)
+    get_pfam_path = lambda hmm: pipe(
+        hmm.accession.decode('utf-8').split('.')[0],
+        lambda x: hmm_dir / 'profiles' / acc2type[x] / f'{x}.hmm'
+    )
+    split_hmm(path_pfam_a, get_pfam_path, not quiet)
 
-    if not quiet:
-        hmms = tqdm(hmms, desc='Writing hmms')
-
-    for hmm in hmms:
-        acc = hmm.accession.decode('utf-8').split('.')[0]
-        hmm_type = acc2type.get(acc, UNK_HMM)
-        hmm_path = type_dirs[hmm_type] / f'{acc}.hmm'
-        with hmm_path.open('wb') as f:
-            hmm.write(f)
-
-    domains_dir = profiles_dir / 'Domain'
+    domains_dir = hmm_dir / 'profiles' / 'Domain'
     pk_path = domains_dir / f'{PFAM_PK_NAME}.hmm'
     if not pk_path.exists():
         raise ValueError(f'Expected to find {PFAM_PK_NAME} in {domains_dir}')
     shutil.copy(pk_path, hmm_dir / pk_path.name)
     LOGGER.info(f'Copied PK profile {pk_path.name} to {hmm_dir / pk_path.name}')
-    LOGGER.info('Finished HMM setup')
+    LOGGER.info('Finished Pfam setup')
+
+    if plants:
+        if download:
+            LOGGER.info('Downloading Plant HMMs.')
+            path_plants = download_to_file(PLANT_HMM_URL, root_dir=hmm_dir, text=True)
+        else:
+            path_plants = path_plants or hmm_dir / PLANT_HMM_NAME
+            if not path_plants.exists():
+                raise ValueError(f'Path for plant HMMs {path_plants} does not exist!')
+        get_plants_path = lambda hmm: (
+                hmm_dir / 'profiles' / 'Family' /
+                f"{hmm.name.decode('utf-8').split('.')[0]}.hmm"
+        )
+        split_hmm(path_plants, get_plants_path, not quiet)
+        LOGGER.info('Finished Plants HMM setup')
+
+    LOGGER.info('Finished setup')
 
 
 def gunzip(path_in: Path, path_out: Path | None = None, rm: bool = True) -> Path:
@@ -196,6 +209,19 @@ def parse_pfam_dat(path: Path):
         return pd.DataFrame(
             map(wrap_chunk, chunks),
             columns=['ID', 'Accession', 'Description', 'Type'])
+
+
+def split_hmm(
+        path: Path, get_path: abc.Callable[[HMM], Path] | None = None,
+        verbose: bool = False):
+    with HMMFile(path) as hmms:
+        if verbose:
+            hmms = tqdm(hmms, desc='Splitting HMM')
+        for hmm in hmms:
+            hmm_path = get_path(hmm)
+            hmm_path.parent.mkdir(exist_ok=True, parents=True)
+            with hmm_path.open('wb') as f:
+                hmm.write(f)
 
 
 @tkp_finder.command('find', context_settings={"ignore_unknown_options": True}, no_args_is_help=True)
@@ -341,7 +367,7 @@ def find(
         consume(io.write(chains, f_dir, write_children=True))
         df = aggregate_annotations(
             chains.collapse_children()
-        ).sort_values(['ObjectID', 'HMM_type', 'Start'])
+        ).sort_values(['ParentName', 'HMM_type', 'Start'])
         df.to_csv(f_dir / 'summary.tsv', sep='\t', index=False)
 
 
@@ -417,7 +443,7 @@ def filter_child_overlaps(
     for c in _chains:
         target_children = filter(filt_fn, next(c.iter_children()))
         non_overlapping = resolve_overlaps(
-            target_children, value_fn=val_fn, max_it=int(10**7), verbose=not quiet)
+            target_children, value_fn=val_fn, max_it=int(10 ** 7), verbose=not quiet)
         non_overlapping_ids = [x.id for x in non_overlapping]
         c.children = valfilter(
             lambda x: not filt_fn(x) or x.id in non_overlapping_ids, c.children)
