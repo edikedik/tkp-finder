@@ -168,7 +168,7 @@ def setup(hmm_dir, download, plants, quiet, path_pfam_a, path_pfam_dat, path_pla
                 raise ValueError(f'Path for plant HMMs {path_plants} does not exist!')
         get_plants_path = lambda hmm: (
                 hmm_dir / 'profiles' / 'Family' /
-                f"{hmm.name.decode('utf-8').split('.')[0]}.hmm"
+                f"{hmm.name.decode('utf-8').replace(' ', '_').replace('-', '_')}.hmm"
         )
         split_hmm(path_plants, get_plants_path, not quiet)
         LOGGER.info('Finished Plants HMM setup')
@@ -418,17 +418,16 @@ def calculate_variables(
 @curry
 def annotate_by_hmms(
         chains: ChainList, hmm_paths: abc.Iterable[Path], hmm_type: str,
-        min_size: int | None = None, min_score: float | None = None,
-        min_cov: float | None = None, quiet: bool = True,
+        quiet: bool = True, **kwargs
 ) -> ChainList:
     if not quiet:
         hmm_paths = tqdm(hmm_paths, desc=f'Annotating by HMM {hmm_type}')
     for path in hmm_paths:
+        # if path.stem == PFAM_PK_NAME:
+        #     continue
         map_name = f'{hmm_type}_{path.stem}'
-        annotator = PyHMMer(path, bit_cutoffs='trusted')
-        consume(annotator.annotate(
-            chains, new_map_name=map_name,
-            min_size=min_size, min_score=min_score, min_cov=min_cov))
+        annotator = PyHMMer(path)
+        consume(annotator.annotate(chains, new_map_name=map_name, **kwargs))
     return chains
 
 
@@ -443,7 +442,7 @@ def filter_child_overlaps(
     for c in _chains:
         target_children = filter(filt_fn, next(c.iter_children()))
         non_overlapping = resolve_overlaps(
-            target_children, value_fn=val_fn, max_it=int(10 ** 7), verbose=not quiet)
+            target_children, value_fn=val_fn, max_it=int(10 ** 6), verbose=not quiet)
         non_overlapping_ids = [x.id for x in non_overlapping]
         c.children = valfilter(
             lambda x: not filt_fn(x) or x.id in non_overlapping_ids, c.children)
