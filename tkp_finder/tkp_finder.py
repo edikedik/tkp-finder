@@ -4,6 +4,7 @@ import operator as op
 import shutil
 from collections import abc
 from concurrent.futures import ProcessPoolExecutor
+from itertools import islice, chain
 from pathlib import Path
 from warnings import warn
 
@@ -17,7 +18,7 @@ from lXtractor.util.seq import read_fasta
 from lXtractor.variables.base import SequenceVariable
 from lXtractor.variables.manager import Manager
 from lXtractor.variables.sequential import SeqEl
-from more_itertools import consume, unique_everseen, split_at, zip_equal
+from more_itertools import consume, unique_everseen, split_at, zip_equal, mark_ends, unzip
 from pyhmmer.plan7 import HMMFile, HMM
 from toolz import keyfilter, valfilter, compose_left, pipe, curry
 from tqdm.auto import tqdm
@@ -27,10 +28,12 @@ PFAM_DAT_URL = "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.
 PLANT_HMM_URL = "https://raw.githubusercontent.com/edikedik/tkp-finder/master/Appendix_4/Plant_Pkinase_fam.hmm"
 PFAM_A_NAME = 'Pfam-A.hmm'
 PFAM_DAT_NAME = 'Pfam-A.hmm.dat'
+PFAM_ENT_NAME = 'pfam_entries.tsv'
 PLANT_HMM_NAME = 'Plant_Pkinase_fam.hmm'
 PFAM_PK_NAME = 'PF00069'
 PK_NAME = 'PK'
 PPK_NAME = 'PPK'
+GAP_NAME = 'X'
 UNK_HMM = 'unknown'
 VARIABLES = (
     SeqEl(30),  # Beta-3 Lys
@@ -47,7 +50,6 @@ handler.setFormatter(formatter)
 LOGGER.addHandler(handler)
 
 
-# TODO: Second aggregation in a human-readable format: LEVEL ...-x-(start-N-end)-x-...
 # TODO: add TM option prediction
 
 
@@ -136,7 +138,7 @@ def setup(hmm_dir, download, plants, quiet, path_pfam_a, path_pfam_dat, path_pla
         LOGGER.info(f'Using existing {path_pfam_a, path_pfam_dat}')
 
     df = parse_pfam_dat(path_pfam_dat)
-    df.to_csv(hmm_dir / 'pfam_entries.tsv', sep='\t', index=False)
+    df.to_csv(hmm_dir / PFAM_ENT_NAME, sep='\t', index=False)
     LOGGER.info(f'Obtained {len(df)} metadata entries from {path_pfam_dat}')
 
     acc2type = {
@@ -360,6 +362,7 @@ def find(
         results = tqdm(results, desc='Processing inputs', total=len(fasta))
 
     io = ChainIO(verbose=False if use_parallel else not quiet)
+    dfs = []
     for f, chains in zip_equal(fasta, results):
         if chains is None or len(chains) == 0:
             continue
@@ -368,7 +371,17 @@ def find(
         df = aggregate_annotations(
             chains.collapse_children()
         ).sort_values(['ParentName', 'HMM_type', 'Start'])
+        df['InputName'] = f.stem
+        dfs.append(df)
         df.to_csv(f_dir / 'summary.tsv', sep='\t', index=False)
+
+    LOGGER.info('Merging and formatting summaries')
+    df = pd.concat(dfs)
+    df_fmt = format_summaries(df, hmm_dir)
+    df.to_csv(output / 'summary.tsv', sep='\t', index=False)
+    df_fmt.to_csv(output / 'summary_fmt.tsv', sep='\t', index=False)
+
+    LOGGER.info('Completed')
 
 
 @curry
@@ -442,7 +455,8 @@ def filter_child_overlaps(
     for c in _chains:
         target_children = filter(filt_fn, next(c.iter_children()))
         non_overlapping = resolve_overlaps(
-            target_children, value_fn=val_fn, max_it=int(10 ** 6), verbose=not quiet)
+            target_children, value_fn=val_fn, max_it=int(10 ** 6)
+        )
         non_overlapping_ids = [x.id for x in non_overlapping]
         c.children = valfilter(
             lambda x: not filt_fn(x) or x.id in non_overlapping_ids, c.children)
@@ -489,12 +503,73 @@ def aggregate_annotations(
             hmm_type, hmm_name = c.id.split('_')[:2]
         score = next(filter(lambda x: x[0].endswith('score'), c.meta.items()))[1]
         parent_name = c.parent.name
-        return hmm_type, hmm_name, c.id, parent_name, c.start, c.end, score
+        parent_size = len(c.parent)
+        return hmm_type, hmm_name, parent_name, parent_size, c.id, c.start, c.end, score
 
     return pd.DataFrame(
         map(agg_one, chains),
-        columns=['HMM_type', 'HMM', 'ObjectID', 'ParentName', 'Start', 'End', 'BitScore']
+        columns=['HMM_type', 'HMM', 'ParentName', 'ParentSize',
+                 'ObjectID', 'Start', 'End', 'BitScore']
     )
+
+
+def merge_summaries(base: Path):
+    def agg(p):
+        df = pd.read_csv(p, sep='\t')
+        df['InputName'] = p.parent.name.split('.')[0]
+        return df
+
+    return pd.concat(map(agg, base.glob('*/summary.tsv')))
+
+
+def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
+    def fmt_obj(x):
+        hmm_name = x.HMM
+        try:
+            obj_name = acc2desc[hmm_name]
+        except KeyError:
+            obj_name = x.ObjectID.split('|')[0]
+        obj_size = x.End - x.Start + 1
+        return f'({obj_name}~{obj_size})'
+
+    def fmt_gap(x1, x2=None):
+        if x2 is None:
+            return f'(X~{x1.Start - 1})'
+        return f'(X~{x2.Start - x1.End - 1})'
+
+    def fmt_pair(x):
+        is_fst, is_lst, (x1, x2) = x
+        if is_fst and is_lst:
+            return f'.{fmt_gap(x1)}-{fmt_obj(x1)}'
+        if is_fst:
+            return f'.{fmt_gap(x1)}-{fmt_obj(x1)}-{fmt_gap(x1, x2)}'
+        if is_lst:
+            return f'-{fmt_obj(x1)}'
+        return f'{fmt_obj(x1)}-{fmt_gap(x1, x2)}'
+
+    def fmt(gg):
+
+        pairs = mark_ends(zip(
+            gg.itertuples(index=False),
+            chain(islice(gg.itertuples(index=False), 1, None), (len(gg),))
+        ))
+
+        last = gg.iloc[-1]
+        tail_size = last['ParentSize'] - last['End']
+
+        return ''.join(map(fmt_pair, pairs)) + f'-(X~{tail_size}).'
+
+    def fmt_groups(gg):
+        total = gg.iloc[-1]['ParentSize']
+        names, formatted = unzip((g, fmt(x)) for g, x in gg.groupby('HMM_type'))
+        return pd.Series([*formatted, total], index=[*names, 'TotalSize'])
+
+    hmm_df = pd.read_csv(hmm_dir / PFAM_ENT_NAME, sep='\t')
+    acc2desc = dict(hmm_df[['Accession', 'Description']].itertuples(index=False))
+
+    return df.groupby(
+        ['InputName', 'ParentName'], as_index=False
+    ).apply(fmt_groups)
 
 
 @curry
