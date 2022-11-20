@@ -1,9 +1,9 @@
+import logging
 from collections import abc
 from itertools import filterfalse
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-import biolib
 from lXtractor.core import ChainSequence, ChainList
 from lXtractor.core.segment import Segment
 from lXtractor.util.seq import write_fasta
@@ -12,6 +12,8 @@ from more_itertools import peekable, zip_equal
 
 class DeepTMHMM:
     def __init__(self):
+        import biolib
+        biolib.biolib_logging.logger.setLevel(logging.CRITICAL)
         self.interface = biolib.load('DTU/DeepTMHMM')
 
     def run(

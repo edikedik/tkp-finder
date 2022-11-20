@@ -9,6 +9,7 @@ from pathlib import Path
 from warnings import warn
 
 import click
+import numpy as np
 import pandas as pd
 from lXtractor.core import ChainSequence, ChainList, ChainInitializer, ChainIO
 from lXtractor.core.segment import resolve_overlaps
@@ -18,10 +19,12 @@ from lXtractor.util.seq import read_fasta
 from lXtractor.variables.base import SequenceVariable
 from lXtractor.variables.manager import Manager
 from lXtractor.variables.sequential import SeqEl
-from more_itertools import consume, unique_everseen, split_at, zip_equal, mark_ends, unzip
+from more_itertools import consume, unique_everseen, split_at, zip_equal, mark_ends, unzip, collapse
 from pyhmmer.plan7 import HMMFile, HMM
 from toolz import keyfilter, valfilter, compose_left, pipe, curry
 from tqdm.auto import tqdm
+
+from tkp_finder.deeptm import DeepTMHMM
 
 PFAM_A_URL = "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.gz"
 PFAM_DAT_URL = "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.dat.gz"
@@ -42,15 +45,28 @@ VARIABLES = (
     SeqEl(141), SeqEl(142), SeqEl(143),  # DFG
 )
 MOTIF = 'KXXXDDXX'
+ANNOTATION_CATEGORIES = (
+    'Coiled-coil', 'Disordered', 'Domain', 'Family', 'Motif', 'Repeat', 'TM', 'ALL')
 
-LOGGER = logging.getLogger(__name__)
-handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-LOGGER.addHandler(handler)
+LOGGER = logging.getLogger('tkp-finder')
 
 
-# TODO: add TM option prediction
+# TODO: issue: logging is still duplicated...
+# TODO: lX: HMM coverage doesn't take into account HMM size and the name is misleading
+# TODO: also extract motif (the subsequent pivoting might cause problems)
+
+
+def setup_logger(logger: logging.Logger | None, level: int | None):
+    if logger is None:
+        logger = logging.getLogger('tkp-finder')
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(level or logging.WARNING)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(level or logging.WARNING)
+    return logger
 
 
 @click.group(
@@ -112,8 +128,9 @@ def setup(hmm_dir, download, plants, quiet, path_pfam_a, path_pfam_dat, path_pla
 
     For a fist-time usage, invoke `tkp-finder setup -H hmm -d`.
     """
-    if not quiet:
-        LOGGER.setLevel(logging.INFO)
+    level = logging.WARNING if quiet else logging.INFO
+    setup_logger(None, level=level)
+    LOGGER.info('Running setup')
 
     hmm_dir = Path.cwd() / 'hmm' if hmm_dir is None else Path(hmm_dir)
     hmm_dir.mkdir(exist_ok=True, parents=True)
@@ -234,7 +251,8 @@ def split_hmm(
          'PK profile (PF00069.hmm). See `tkp-finder setup` on how to prepare this dir.'
 )
 @click.option(
-    '-t', '--hmm_type', multiple=True, default=['Family', 'Domain', 'Motif'], show_default=True,
+    '-a', '--ann_type', multiple=True, type=click.Choice(ANNOTATION_CATEGORIES),
+    default=['Family', 'Domain', 'Motif', 'TM'], show_default=True,
     help='Which HMM types to use for annotating the discovered TKPs. The names must correspond to '
          'folders within he `hmm_dir`.'
 )
@@ -245,11 +263,11 @@ def split_hmm(
 @click.option(
     '-m', '--motif', default=MOTIF, show_default=True,
     help='A motif to discriminate between PKs and pseudo PKs. This corresponds to the following '
-         'conserved elements:: \n'
-         '(1) b3-Lys'
-         '(2) aC-helix Glu'
-         '(3-4-5) HRD motif'
-         '(6-7-8) DFG motif'
+         'conserved elements: '
+         '(1) b3-Lys '
+         '(2) aC-helix Glu '
+         '(3-4-5) HRD motif '
+         '(6-7-8) DFG motif.'
 )
 @click.option(
     '-o', '--output', type=click.Path(file_okay=False, dir_okay=True, writable=True),
@@ -293,7 +311,7 @@ def split_hmm(
     help='Disable logging and progress bar'
 )
 def find(
-        fasta, hmm_dir, hmm_type, pk_profile, motif, output,
+        fasta, hmm_dir, ann_type, pk_profile, motif, output,
         pk_map_name, ppk_map_name, min_pk_domain_size, min_pk_domains,
         min_hmm_score, min_hmm_cov,
         timeout, num_proc, quiet,
@@ -308,8 +326,24 @@ def find(
     All the extracted profiles are saved as a nested collection of files.
     Additionally, for each input fasta, it produces the aggregated `summary.tsv`.
     """
-    if not quiet:
-        LOGGER.setLevel(logging.INFO)
+    # if not quiet:
+    #     LOGGER.setLevel(logging.INFO)
+    level = logging.WARNING if quiet else logging.INFO
+    setup_logger(None, level=level)
+
+    if not isinstance(ann_type, list):
+        ann_type = list(ann_type)
+
+    if 'ALL' in ann_type:
+        ann_type = ANNOTATION_CATEGORIES[:-1]
+        LOGGER.info(f'Using ALL available annotation types: {ann_type}')
+
+    if 'TM' in ann_type:
+        use_tm = True
+        ann_type.remove('TM')
+    else:
+        use_tm = False
+
     fasta = [Path(f) for f in fasta]
     if not fasta:
         raise ValueError('No inputs provided. Use -h or --help to invoke help.')
@@ -340,7 +374,7 @@ def find(
     pipe_one = discover_and_annotate(
         pk_profile=pk_profile,
         hmm_base_dir=hmm_dir / 'profiles',
-        hmm_types=hmm_type,
+        hmm_types=ann_type,
         min_pk_domain_size=min_pk_domain_size,
         min_pk_domains=min_pk_domains,
         min_hmm_score=min_hmm_score,
@@ -361,27 +395,110 @@ def find(
     if not quiet and len(fasta) > 1:
         results = tqdm(results, desc='Processing inputs', total=len(fasta))
 
-    io = ChainIO(verbose=False if use_parallel else not quiet)
-    dfs = []
+    chains_acc = []
+
     for f, chains in zip_equal(fasta, results):
         if chains is None or len(chains) == 0:
             continue
-        f_dir = output / f.name
-        consume(io.write(chains, f_dir, write_children=True))
-        df = aggregate_annotations(
-            chains.collapse_children()
-        ).sort_values(['ParentName', 'HMM_type', 'Start'])
-        df['InputName'] = f.stem
-        dfs.append(df)
-        df.to_csv(f_dir / 'summary.tsv', sep='\t', index=False)
+        chains_acc.append(chains)
 
-    LOGGER.info('Merging and formatting summaries')
-    df = pd.concat(dfs)
+    chains = ChainList(chain.from_iterable(chains_acc))
+    LOGGER.info(f'Total TKPs found: {len(chains)}')
+
+    if use_tm:
+        LOGGER.info('Annotating by DeepTMHMM')
+        annotate_by_deep_tm(chains, category='TM')
+
+    LOGGER.info('Saving results')
+    io = ChainIO(num_proc=num_proc, verbose=not quiet)
+    consume(collapse(
+        io.write(c, output / f.name, write_children=True)
+        for c, f in zip_equal(chains_acc, fasta)
+    ))
+
+    LOGGER.info('Composing summaries')
+    df = pd.concat(
+        [aggregate_annotations(c.collapse_children(), inp_name=f.stem)
+         for c, f in zip_equal(chains_acc, fasta)]
+    )
+
     df_fmt = format_summaries(df, hmm_dir)
     df.to_csv(output / 'summary.tsv', sep='\t', index=False)
     df_fmt.to_csv(output / 'summary_fmt.tsv', sep='\t', index=False)
 
     LOGGER.info('Completed')
+
+
+@curry
+def discover_and_annotate(
+        path: Path, pk_profile: Path, hmm_base_dir: Path,
+        hmm_types: abc.Iterable[str] = ('Family', 'Domain', 'Motif'),
+        min_pk_domain_size: int = 150, min_pk_domains: int = 2,
+        min_hmm_score: float = 0, min_hmm_cov: float = 0.5, motif=MOTIF,
+        pk_map_name: str = PK_NAME, ppk_name: str = PPK_NAME,
+        seq_variables: abc.Sequence[SequenceVariable] = VARIABLES,
+        quiet: bool = True,
+) -> ChainList[ChainSequence]:
+    @curry
+    def value_fn(c: ChainSequence, hmm_type: str):
+        scores = keyfilter(
+            lambda x: x.startswith(hmm_type) and x.endswith('score'),
+            c.meta)
+        if len(scores) > 1:
+            raise ValueError(
+                f'Expected exactly one score for hmm type {hmm_type}, '
+                f'got {len(scores)}: {scores}')
+        return scores.popitem()[1]
+
+    @curry
+    def annotate_and_filter(chains, hmm_type):
+        hmms = list((hmm_base_dir / hmm_type).glob('*hmm'))
+        if hmm_type == 'TM':
+            return annotate_by_deep_tm(chains, category='TM')
+        return pipe(
+            chains,
+            annotate_by_hmms(
+                hmm_paths=hmms, hmm_type=hmm_type,
+                min_score=min_hmm_score, min_cov=min_hmm_cov,
+                quiet=quiet),
+            filter_child_overlaps(
+                filt_fn=lambda c: any(
+                    (x.startswith(hmm_type) for x in c.fields)
+                ),
+                val_fn=value_fn(hmm_type=hmm_type),
+                quiet=quiet
+            )
+        )
+
+    # if not pk_map_name.startswith('Domain'):
+    #     pk_map_name = f'Domain_{pk_map_name}'
+
+    chains = find_tkps(
+        path,
+        min_size=min_pk_domain_size, min_domains=min_pk_domains,
+        map_name=pk_map_name, profile=pk_profile, quiet=quiet
+    )
+    if len(chains) == 0:
+        LOGGER.info(f'Found no TKPs in {path}')
+        return chains
+
+    chains = compose_left(*(annotate_and_filter(hmm_type=x) for x in hmm_types))(chains)
+
+    pk_children = filter(lambda x: pk_map_name in x, chains.collapse_children())
+    vs_df = calculate_variables(pk_children, seq_variables, pk_map_name)
+
+    annotate_ppks(
+        chains.collapse_children(), vs_df,
+        pk_name=pk_map_name, ppk_name=ppk_name, motif=motif
+    )
+
+    return chains
+
+
+def annotate_by_deep_tm(chains: abc.Iterable[ChainSequence], **kwargs):
+    annotator = DeepTMHMM()
+    consume(annotator.annotate(chains, **kwargs))
+    return chains
 
 
 @curry
@@ -493,24 +610,37 @@ def annotate_ppks(
 
 def aggregate_annotations(
         chains: abc.Iterable[ChainSequence],
-        pk_name: str = PK_NAME, ppk_name: str = PPK_NAME
+        pk_name: str = PK_NAME, ppk_name: str = PPK_NAME,
+        inp_name: str | None = None
 ) -> pd.DataFrame:
+    def get_score(c: ChainSequence):
+        return next(filter(lambda x: x[0].endswith('score'), c.meta.items()))[1]
+
     def agg_one(c):
         if pk_name in c.name or ppk_name in c.name:
             hmm_type = 'Target'
             hmm_name = c.id.split('_')[0]
+            score = get_score(c)
+        elif 'TM' in c.name:
+            hmm_type = 'TM'
+            hmm_name = c.id.split('_')[0]
+            score = np.nan
         else:
             hmm_type, hmm_name = c.id.split('_')[:2]
-        score = next(filter(lambda x: x[0].endswith('score'), c.meta.items()))[1]
+            score = get_score(c)
+        # score = next(filter(lambda x: x[0].endswith('score'), c.meta.items()))[1]
         parent_name = c.parent.name
         parent_size = len(c.parent)
         return hmm_type, hmm_name, parent_name, parent_size, c.id, c.start, c.end, score
 
-    return pd.DataFrame(
+    df = pd.DataFrame(
         map(agg_one, chains),
         columns=['HMM_type', 'HMM', 'ParentName', 'ParentSize',
                  'ObjectID', 'Start', 'End', 'BitScore']
     )
+    if inp_name:
+        df['InputName'] = inp_name
+    return df
 
 
 def merge_summaries(base: Path):
@@ -570,70 +700,6 @@ def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
     return df.groupby(
         ['InputName', 'ParentName'], as_index=False
     ).apply(fmt_groups)
-
-
-@curry
-def discover_and_annotate(
-        path: Path, pk_profile: Path, hmm_base_dir: Path,
-        hmm_types: abc.Iterable[str] = ('Family', 'Domain', 'Motif'),
-        min_pk_domain_size: int = 150, min_pk_domains: int = 2,
-        min_hmm_score: float = 0, min_hmm_cov: float = 0.5, motif=MOTIF,
-        pk_map_name: str = PK_NAME, ppk_name: str = PPK_NAME,
-        seq_variables: abc.Sequence[SequenceVariable] = VARIABLES,
-        quiet: bool = True,
-) -> ChainList[ChainSequence]:
-    @curry
-    def value_fn(c: ChainSequence, hmm_type: str):
-        scores = keyfilter(
-            lambda x: x.startswith(hmm_type) and x.endswith('score'),
-            c.meta)
-        if len(scores) > 1:
-            raise ValueError(
-                f'Expected exactly one score for hmm type {hmm_type}, '
-                f'got {len(scores)}: {scores}')
-        return scores.popitem()[1]
-
-    @curry
-    def annotate_and_filter(chains, hmm_type):
-        hmms = list((hmm_base_dir / hmm_type).glob('*hmm'))
-        return pipe(
-            chains,
-            annotate_by_hmms(
-                hmm_paths=hmms, hmm_type=hmm_type,
-                min_score=min_hmm_score, min_cov=min_hmm_cov,
-                quiet=quiet),
-            filter_child_overlaps(
-                filt_fn=lambda c: any(
-                    (x.startswith(hmm_type) for x in c.fields)
-                ),
-                val_fn=value_fn(hmm_type=hmm_type),
-                quiet=quiet
-            )
-        )
-
-    # if not pk_map_name.startswith('Domain'):
-    #     pk_map_name = f'Domain_{pk_map_name}'
-
-    chains = find_tkps(
-        path,
-        min_size=min_pk_domain_size, min_domains=min_pk_domains,
-        map_name=pk_map_name, profile=pk_profile, quiet=quiet
-    )
-    if len(chains) == 0:
-        LOGGER.info(f'Found no TKPs in {path}')
-        return chains
-
-    chains = compose_left(*(annotate_and_filter(hmm_type=x) for x in hmm_types))(chains)
-
-    pk_children = filter(lambda x: pk_map_name in x, chains.collapse_children())
-    vs_df = calculate_variables(pk_children, seq_variables, pk_map_name)
-
-    annotate_ppks(
-        chains.collapse_children(), vs_df,
-        pk_name=pk_map_name, ppk_name=ppk_name, motif=motif
-    )
-
-    return chains
 
 
 def yield_sequentially(fn, *args):
