@@ -4,10 +4,10 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import biolib
-from lXtractor.core import ChainSequence
+from lXtractor.core import ChainSequence, ChainList
 from lXtractor.core.segment import Segment
 from lXtractor.util.seq import write_fasta
-from more_itertools import peekable
+from more_itertools import peekable, zip_equal
 
 
 class DeepTMHMM:
@@ -16,7 +16,7 @@ class DeepTMHMM:
 
     def run(
             self, seqs: abc.Iterable[ChainSequence] | abc.Iterable[tuple[str, str]] | Path
-    ) -> list[tuple[str, list[Segment]]]:
+    ) -> abc.Iterator[tuple[str, list[Segment]]]:
         match seqs:
             case abc.Iterable():
                 peek = peekable(seqs)
@@ -42,7 +42,7 @@ class DeepTMHMM:
             case _:
                 raise TypeError(f'Invalid input type {type(seqs)}')
 
-        return list(self.parse_output_gff(res.get_output_file('/TMRs.gff3').get_data()))
+        return self.parse_output_gff(res.get_output_file('/TMRs.gff3').get_data())
 
     def run_cli(self, inp_fasta: Path | str):
         return self.interface.cli(args=f'--fasta {inp_fasta}')
@@ -53,8 +53,8 @@ class DeepTMHMM:
             lines = map(
                 lambda x: x.split('\t'),
                 filterfalse(lambda x: not x or x.startswith('#'), c.split('\n')))
-            peek = peekable(lines)
-            fst = peek.peek(None)
+            lines = peekable(lines)
+            fst = lines.peek(None)
             assert fst, 'Non-empty chunk of data'
             chain_id = fst[0]
             return chain_id, [Segment(int(x[2]), int(x[3]), x[1]) for x in lines]
@@ -67,8 +67,16 @@ class DeepTMHMM:
         chunks = inp.split('//')
         return map(parse_chunk, chunks)
 
-    def annotate(self, chains: abc.Iterable[ChainSequence]):
-        pass
+    def annotate(
+            self, chains: abc.Iterable[ChainSequence], category: str = 'DeepTMHMM', **kwargs
+    ) -> abc.Generator[ChainSequence]:
+        if not isinstance(chains, ChainList):
+            chains: ChainList[ChainSequence] = ChainList(chains)
+        results = self.run(chains)
+        for (c_id, segments), c in zip_equal(results, chains):
+            assert c_id == c.id, "IDs and order are preserved"
+            for s in segments:
+                yield c.spawn_child(s.start, s.end, f'{category}_{s.name}', **kwargs)
 
 
 if __name__ == '__main__':
