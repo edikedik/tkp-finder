@@ -16,15 +16,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 class DeepTMHMM:
-    def __init__(self, biolib_account_login: bool = False):
+    def __init__(self, token: str | None = None):
         import biolib
-        # biolib.set_api_token('m4YbOukiwOilinBDYLlNnS6VIxuayGiq2DlejEdikVE')
-        if biolib_account_login:
-            try:
-                print('Send KeyboardInterrupt to omit')
-                biolib.login()
-            except KeyboardInterrupt:
-                pass
+        if token:
+            biolib.set_api_token(token)
 
         biolib.biolib_logging.logger.setLevel(logging.CRITICAL)
         self.biolib = biolib
