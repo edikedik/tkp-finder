@@ -20,7 +20,7 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 dependencies = [
-    'biolib>=1.1.700',
+    'pybiolib>=1.1.700',
     "click>=8",
     "more-itertools>=9.0",
     "toolz>=0.12",

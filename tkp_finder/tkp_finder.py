@@ -4,7 +4,7 @@ import operator as op
 import shutil
 from collections import abc
 from concurrent.futures import ProcessPoolExecutor
-from itertools import islice, chain
+from itertools import islice, chain, starmap
 from pathlib import Path
 from warnings import warn
 
@@ -19,7 +19,7 @@ from lXtractor.util.seq import read_fasta
 from lXtractor.variables.base import SequenceVariable
 from lXtractor.variables.manager import Manager
 from lXtractor.variables.sequential import SeqEl
-from more_itertools import consume, unique_everseen, split_at, zip_equal, mark_ends, unzip, collapse
+from more_itertools import consume, unique_everseen, split_at, zip_equal, mark_ends, unzip, collapse, chunked
 from pyhmmer.plan7 import HMMFile, HMM
 from toolz import keyfilter, valfilter, compose_left, pipe, curry
 from tqdm.auto import tqdm
@@ -51,9 +51,8 @@ ANNOTATION_CATEGORIES = (
 LOGGER = logging.getLogger('tkp-finder')
 
 
-# TODO: issue: logging is still duplicated...
+# TODO: issue: logging is still duplicated when using biolib ...
 # TODO: lX: HMM coverage doesn't take into account HMM size and the name is misleading
-# TODO: also extract motif (the subsequent pivoting might cause problems)
 
 
 def setup_logger(logger: logging.Logger | None, level: int | None):
@@ -307,14 +306,20 @@ def split_hmm(
          'separate process. HINT: one may split large fasta files for faster processing.'
 )
 @click.option(
+    '--deep_tm_chunk_size', type=int, default=100, show_default=True,
+    help='The number of sequences in a single query for DeepTMHMM. '
+         'Should be as large as possible, although too large files are blocked by the server. '
+         'They did not specify the file size limit though...'
+)
+@click.option(
     '-q', '--quiet', is_flag=True, default=False,
-    help='Disable logging and progress bar'
+    help='Disable stdout logging and progress bar.'
 )
 def find(
         fasta, hmm_dir, ann_type, pk_profile, motif, output,
         pk_map_name, ppk_map_name, min_pk_domain_size, min_pk_domains,
         min_hmm_score, min_hmm_cov,
-        timeout, num_proc, quiet,
+        timeout, num_proc, deep_tm_chunk_size, quiet,
 ):
     """
     The command finds TKPs in a list of input fasta files.
@@ -393,31 +398,46 @@ def find(
     if not quiet and len(fasta) > 1:
         results = tqdm(results, desc='Processing inputs', total=len(fasta))
 
-    chains_acc = []
+    completed = []
 
     for f, chains in zip_equal(fasta, results):
         if chains is None or len(chains) == 0:
             continue
-        chains_acc.append(chains)
+        completed.append((f, chains))
 
-    chains = ChainList(chain.from_iterable(chains_acc))
-    LOGGER.info(f'Total TKPs found: {len(chains)}')
+    _, completed_chains = unzip(completed)
+
+    completed_chains = ChainList(chain.from_iterable(completed_chains))
+    LOGGER.info(f'Total TKPs found: {len(completed_chains)}')
 
     if use_tm:
         LOGGER.info('Annotating by DeepTMHMM')
-        annotate_by_deep_tm(chains, category='TM')
+        if not quiet:
+            bar = tqdm(
+                desc=f'Annotating by DeepTMHMM; chunk_size: {deep_tm_chunk_size}',
+                total=len(completed_chains)
+            )
+        for chunk in chunked(completed_chains, deep_tm_chunk_size):
+            annotate_by_deep_tm(chunk, category='TM')
+            if not quiet:
+                bar.update(len(chunk))
+        if not quiet:
+            bar.close()
 
     LOGGER.info('Saving results')
-    io = ChainIO(num_proc=num_proc, verbose=not quiet)
-    consume(collapse(
+    io = ChainIO(num_proc=num_proc, verbose=False)
+    staged = collapse(
         io.write(c, output / f.name, write_children=True)
-        for c, f in zip_equal(chains_acc, fasta)
-    ))
+        for f, c in completed
+    )
+    if not quiet:
+        staged = tqdm(staged, desc='Writing objects')
+    consume(staged)
 
     LOGGER.info('Composing summaries')
     df = pd.concat(
-        [aggregate_annotations(c.collapse_children(), inp_name=f.stem)
-         for c, f in zip_equal(chains_acc, fasta)]
+        aggregate_annotations(c.collapse_children(), inp_name=f.stem)
+        for f, c in completed
     )
 
     df_fmt = format_summaries(df, hmm_dir)
@@ -570,7 +590,7 @@ def filter_child_overlaps(
     for c in _chains:
         target_children = filter(filt_fn, next(c.iter_children()))
         non_overlapping = resolve_overlaps(
-            target_children, value_fn=val_fn, max_it=int(10 ** 6)
+            target_children, value_fn=val_fn, max_it=int(10 ** 5)
         )
         non_overlapping_ids = [x.id for x in non_overlapping]
         c.children = valfilter(
@@ -612,7 +632,9 @@ def aggregate_annotations(
         inp_name: str | None = None
 ) -> pd.DataFrame:
     def get_score(c: ChainSequence):
-        return next(filter(lambda x: x[0].endswith('score'), c.meta.items()))[1]
+        return next(filter(
+            lambda x: x[0].endswith('score'),
+            c.meta.items()))[1]
 
     def agg_one(c):
         if pk_name in c.name or ppk_name in c.name:
@@ -626,7 +648,6 @@ def aggregate_annotations(
         else:
             hmm_type, hmm_name = c.id.split('_')[:2]
             score = get_score(c)
-        # score = next(filter(lambda x: x[0].endswith('score'), c.meta.items()))[1]
         parent_name = c.parent.name
         parent_size = len(c.parent)
         return hmm_type, hmm_name, parent_name, parent_size, c.id, c.start, c.end, score
@@ -656,7 +677,7 @@ def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
         try:
             obj_name = acc2desc[ann_name]
         except KeyError:
-            obj_name = x.ObjectID.split('|')[0].removeprefix(x.AnnType)
+            obj_name = x.ObjectID.split('|')[0].removeprefix(f'{x.AnnType}_')
         obj_size = x.End - x.Start + 1
         return f'({obj_name}~{obj_size})'
 
@@ -687,22 +708,24 @@ def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
 
         return ''.join(map(fmt_pair, pairs)) + f'-(X~{tail_size}).'
 
-    def fmt_groups(gg):
+    def fmt_groups(g, gg):
         total = gg.iloc[-1]['ParentSize']
         groups = gg.groupby('AnnType')
         names, formatted = map(list, unzip((g, fmt(x)) for g, x in groups))
         ann_names = [f'{n}Names' for n in names]
         ann_names_values = ['-'.join(x['AnnName']) for _, x in groups]
+        # print(names, formatted, ann_names, ann_names_values)
         return pd.Series(
-            [*formatted, *ann_names_values, total],
-            index=[*names, *ann_names, 'TotalSize'])
+            [*g, *formatted, *ann_names_values, total],
+            index=['InputName', 'ParentName', *names, *ann_names, 'TotalSize'])
 
     hmm_df = pd.read_csv(hmm_dir / PFAM_ENT_NAME, sep='\t')
     acc2desc = dict(hmm_df[['Accession', 'Description']].itertuples(index=False))
 
-    return df.groupby(
-        ['InputName', 'ParentName'], as_index=False
-    ).apply(fmt_groups)
+    df = df.sort_values(['InputName', 'ParentName', 'AnnType']).reset_index(drop=True)
+    groups = df.groupby(['InputName', 'ParentName'], as_index=False)
+
+    return pd.DataFrame(starmap(fmt_groups, groups))
 
 
 def yield_sequentially(fn, *args):
