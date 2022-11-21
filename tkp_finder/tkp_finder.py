@@ -326,8 +326,6 @@ def find(
     All the extracted profiles are saved as a nested collection of files.
     Additionally, for each input fasta, it produces the aggregated `summary.tsv`.
     """
-    # if not quiet:
-    #     LOGGER.setLevel(logging.INFO)
     level = logging.WARNING if quiet else logging.INFO
     setup_logger(None, level=level)
 
@@ -335,7 +333,7 @@ def find(
         ann_type = list(ann_type)
 
     if 'ALL' in ann_type:
-        ann_type = ANNOTATION_CATEGORIES[:-1]
+        ann_type = list(ANNOTATION_CATEGORIES[:-1])
         LOGGER.info(f'Using ALL available annotation types: {ann_type}')
 
     if 'TM' in ann_type:
@@ -619,7 +617,7 @@ def aggregate_annotations(
     def agg_one(c):
         if pk_name in c.name or ppk_name in c.name:
             hmm_type = 'Target'
-            hmm_name = c.id.split('_')[0]
+            hmm_name = f"{c.id.split('_')[0]}_{c.meta['motif']}"
             score = get_score(c)
         elif 'TM' in c.name:
             hmm_type = 'TM'
@@ -635,7 +633,7 @@ def aggregate_annotations(
 
     df = pd.DataFrame(
         map(agg_one, chains),
-        columns=['HMM_type', 'HMM', 'ParentName', 'ParentSize',
+        columns=['AnnType', 'AnnName', 'ParentName', 'ParentSize',
                  'ObjectID', 'Start', 'End', 'BitScore']
     )
     if inp_name:
@@ -653,12 +651,12 @@ def merge_summaries(base: Path):
 
 
 def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
-    def fmt_obj(x):
-        hmm_name = x.HMM
+    def fmt_row(x):
+        ann_name = x.AnnName
         try:
-            obj_name = acc2desc[hmm_name]
+            obj_name = acc2desc[ann_name]
         except KeyError:
-            obj_name = x.ObjectID.split('|')[0]
+            obj_name = x.ObjectID.split('|')[0].removeprefix(x.AnnType)
         obj_size = x.End - x.Start + 1
         return f'({obj_name}~{obj_size})'
 
@@ -670,12 +668,12 @@ def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
     def fmt_pair(x):
         is_fst, is_lst, (x1, x2) = x
         if is_fst and is_lst:
-            return f'.{fmt_gap(x1)}-{fmt_obj(x1)}'
+            return f'.{fmt_gap(x1)}-{fmt_row(x1)}'
         if is_fst:
-            return f'.{fmt_gap(x1)}-{fmt_obj(x1)}-{fmt_gap(x1, x2)}'
+            return f'.{fmt_gap(x1)}-{fmt_row(x1)}-{fmt_gap(x1, x2)}'
         if is_lst:
-            return f'-{fmt_obj(x1)}'
-        return f'{fmt_obj(x1)}-{fmt_gap(x1, x2)}'
+            return f'-{fmt_row(x1)}'
+        return f'{fmt_row(x1)}-{fmt_gap(x1, x2)}'
 
     def fmt(gg):
 
@@ -691,8 +689,13 @@ def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
 
     def fmt_groups(gg):
         total = gg.iloc[-1]['ParentSize']
-        names, formatted = unzip((g, fmt(x)) for g, x in gg.groupby('HMM_type'))
-        return pd.Series([*formatted, total], index=[*names, 'TotalSize'])
+        groups = gg.groupby('AnnType')
+        names, formatted = map(list, unzip((g, fmt(x)) for g, x in groups))
+        ann_names = [f'{n}Names' for n in names]
+        ann_names_values = ['-'.join(x['AnnName']) for _, x in groups]
+        return pd.Series(
+            [*formatted, *ann_names_values, total],
+            index=[*names, *ann_names, 'TotalSize'])
 
     hmm_df = pd.read_csv(hmm_dir / PFAM_ENT_NAME, sep='\t')
     acc2desc = dict(hmm_df[['Accession', 'Description']].itertuples(index=False))
