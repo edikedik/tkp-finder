@@ -494,6 +494,7 @@ def discover_and_annotate(
     chains = find_tkps(
         path,
         min_size=min_pk_domain_size, min_domains=min_pk_domains,
+        min_cov=min_hmm_cov, min_score=min_hmm_score,
         map_name=pk_map_name, profile=pk_profile, quiet=quiet
     )
     if len(chains) == 0:
@@ -521,7 +522,9 @@ def annotate_by_deep_tm(chains: abc.Iterable[ChainSequence], **kwargs):
 
 @curry
 def find_tkps(
-        path: Path, profile: Path, min_size: int = 150, min_domains: int = 2,
+        path: Path, profile: Path,
+        min_size: int = 150, min_domains: int = 2,
+        min_cov: float | None = None, min_score: float | None = None,
         map_name: str = PK_NAME, quiet: bool = True
 ) -> ChainList:
     def wrap_pbar(it):
@@ -541,7 +544,9 @@ def find_tkps(
         ChainList
     )
 
-    consume(annotator.annotate(chains, min_size=min_size, new_map_name=map_name))
+    consume(annotator.annotate(
+        chains, min_size=min_size, min_cov=min_cov,
+        min_score=min_score, new_map_name=map_name))
 
     return pipe(
         chains,
@@ -637,16 +642,17 @@ def aggregate_annotations(
             c.meta.items()))[1]
 
     def agg_one(c):
-        if pk_name in c.name or ppk_name in c.name:
+        if c.name.split('_')[0] in [pk_name, ppk_name]:
             hmm_type = 'Target'
             hmm_name = f"{c.id.split('_')[0]}_{c.meta['motif']}"
             score = get_score(c)
-        elif 'TM' in c.name:
+        elif c.name.split('_')[0] == 'TM':
             hmm_type = 'TM'
             hmm_name = c.id.split('_')[0]
             score = np.nan
         else:
-            hmm_type, hmm_name = c.id.split('_')[:2]
+            hmm_type = c.id.split('_')[0]
+            hmm_name = '_'.join(c.name.split('_')[1:-1])
             score = get_score(c)
         parent_name = c.parent.name
         parent_size = len(c.parent)
@@ -691,7 +697,7 @@ def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
         if is_fst and is_lst:
             return f'.{fmt_gap(x1)}-{fmt_row(x1)}'
         if is_fst:
-            return f'.{fmt_gap(x1)}-{fmt_row(x1)}-{fmt_gap(x1, x2)}'
+            return f'.{fmt_gap(x1)}-{fmt_row(x1)}-{fmt_gap(x1, x2)}-'
         if is_lst:
             return f'-{fmt_row(x1)}'
         return f'{fmt_row(x1)}-{fmt_gap(x1, x2)}'
@@ -713,8 +719,7 @@ def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
         groups = gg.groupby('AnnType')
         names, formatted = map(list, unzip((g, fmt(x)) for g, x in groups))
         ann_names = [f'{n}Names' for n in names]
-        ann_names_values = ['-'.join(x['AnnName']) for _, x in groups]
-        # print(names, formatted, ann_names, ann_names_values)
+        ann_names_values = ['~'.join(x['AnnName']) for _, x in groups]
         return pd.Series(
             [*g, *formatted, *ann_names_values, total],
             index=['InputName', 'ParentName', *names, *ann_names, 'TotalSize'])
@@ -722,7 +727,9 @@ def format_summaries(df: pd.DataFrame, hmm_dir: Path) -> pd.DataFrame:
     hmm_df = pd.read_csv(hmm_dir / PFAM_ENT_NAME, sep='\t')
     acc2desc = dict(hmm_df[['Accession', 'Description']].itertuples(index=False))
 
-    df = df.sort_values(['InputName', 'ParentName', 'AnnType']).reset_index(drop=True)
+    df = df.copy().sort_values(
+        ['InputName', 'ParentName', 'AnnType', 'Start']
+    ).reset_index(drop=True)
     groups = df.groupby(['InputName', 'ParentName'], as_index=False)
 
     return pd.DataFrame(starmap(fmt_groups, groups))
