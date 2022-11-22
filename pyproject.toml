@@ -38,6 +38,11 @@ Source = "https://github.com/edikedik/tkp-finder"
 [tool.hatch.version]
 path = "tkp_finder/__about__.py"
 
+[tool.hatch.build]
+include = [
+    'tkp_finder'
+]
+
 [tool.hatch.envs.default]
 dependencies = [
     "pytest",
