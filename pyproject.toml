@@ -26,7 +26,7 @@ dependencies = [
     "toolz>=0.12",
     "tqdm>=4.64",
     "pandas>=1.5",
-    "lXtractor"
+    "lXtractor==0.1dev4"
 ]
 dynamic = ["version"]
 
