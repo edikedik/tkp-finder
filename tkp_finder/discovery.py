@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import operator as op
 import typing as t
 from collections import abc
-from itertools import pairwise, chain, repeat, islice
+from itertools import pairwise, chain, repeat, islice, starmap
 from pathlib import Path
 
 import lXtractor.chain as lxc
 import lXtractor.ext.hmm as lxh
+from easydict import EasyDict
 from lXtractor.ext import PyHMMer
 from lXtractor.util import read_fasta
+from loguru import logger
 from more_itertools import split_when, mark_ends, one
 from more_itertools.more import always_iterable
 
@@ -119,7 +122,8 @@ def join_overlapping_hits(
     new_child = parent.spawn_child(start, end, map_name, cat, keep=False)
     hit.relate(new_child, map_name, "i", "S")
     new_child.meta.update(filter(lambda it: map_name in it[0], hit.meta.items()))
-    new_child.meta["merged_hit"] = True
+    new_child.meta["merged"] = True
+    new_child.meta["merge_kind"] = "overlapping"
 
     # Handle parent-child relationship and remove old hits
     loc_h1 = one(i for i, c in enumerate(parent.children) if c.id == hits[0].id)
@@ -136,13 +140,18 @@ class PKDiscoverer:
     """
 
     def __init__(
-        self, pyhmm: lxh.PyHMMer | lxh._HmmInpT | None, assign_name: str = PSKD_NAME
+        self,
+        cfg: EasyDict,
+        pyhmm: lxh.PyHMMer | lxh._HmmInpT | None,
+        assign_name: str = PSKD_NAME,
     ):
         """
         :param pyhmm: PyHMMer object with HMM of a PK domain.
         :param assign_name: Internal domain name.
         """
+        self.cfg = cfg
         if pyhmm is None:
+            logger.info("Initializing default PSKD HMM.")
             pyhmm = get_pskd_hmm(name=assign_name)
         if not isinstance(pyhmm, lxh.PyHMMer):
             pyhmm = lxh.PyHMMer(pyhmm)
@@ -160,7 +169,9 @@ class PKDiscoverer:
             in the same sequence. Eg, ``"PSKD_1" -> "PSKD"``.
         :return: An iterator over chain sequence hits.
         """
-        hits = self.pyhmm.annotate(chains, new_map_name=self.assign_name)
+        hits = self.pyhmm.annotate(
+            chains, new_map_name=self.assign_name, **self.cfg.annotation
+        )
         if strip_hmm_ord:
             for hit in hits:
                 hit.name = hit.name.split("_")[0]
@@ -171,9 +182,6 @@ class PKDiscoverer:
     def join_hits(
         self,
         parent_chain: lxc.ChainSequence,
-        max_insert: int,
-        min_size: int,
-        max_overlap: int,
     ) -> None:
         """
         Oftentimes large inserts cause fragmentary hits. This method attempts
@@ -223,10 +231,10 @@ class PKDiscoverer:
                 return True
             c1_end, c2_start, insert_size = ends
             return (
-                len(c1) < min_size
-                or len(c2) < min_size
+                len(c1) < self.cfg.min_size
+                or len(c2) < self.cfg.min_size
                 or c1_end >= c2_start
-                or insert_size > max_insert
+                or insert_size > self.cfg.max_insert
             )
 
         def not_indirectly_mergeable(
@@ -238,42 +246,50 @@ class PKDiscoverer:
                 return True
             insert_size = ends[-1]
             items_c1_end = take_n_filtered(
-                lambda x: x is not None, c1[self.assign_name], max_overlap
+                lambda x: x is not None, c1[self.assign_name], self.cfg.max_overlap
             )
             items_c2_start = take_n_filtered(
-                lambda x: x is not None, c2[self.assign_name][::-1], max_overlap
+                lambda x: x is not None,
+                c2[self.assign_name][::-1],
+                self.cfg.max_overlap,
             )
             overlap = set(items_c1_end) & set(items_c2_start)
 
             return (
-                len(c1) < min_size
-                or len(c2) < min_size
-                or insert_size > max_insert
-                or len(overlap) > max_overlap
+                len(c1) < self.cfg.min_size
+                or len(c2) < self.cfg.min_size
+                or insert_size > self.cfg.max_insert
+                or len(overlap) > self.cfg.max_overlap
             )
 
         def populate_meta(
             merged_hit: lxc.ChainSequence, hits: abc.Sequence[lxc.ChainSequence]
         ):
             num_nodes_covered = sum(x is not None for x in merged_hit[self.assign_name])
+            cov_hmm_name = f"{self.assign_name}_cov_hmm"
+            cov_seq_name = f"{self.assign_name}_cov_seq"
             score_name = f"{self.assign_name}_score"
             bias_name = f"{self.assign_name}_bias"
             pval_name = f"{self.assign_name}_pvalue"
             score_sum = sum(h.meta[score_name] for h in hits)
             pval_max = max(h.meta[pval_name] for h in hits)
             meta_upd = {
-                "cov_hmm": num_nodes_covered / self.pyhmm.hmm.M,
-                "cov_seq": num_nodes_covered / len(merged_hit),
+                cov_hmm_name: num_nodes_covered / self.pyhmm.hmm.M,
+                cov_seq_name: num_nodes_covered / len(merged_hit),
                 score_name: score_sum,
                 pval_name: pval_max,
                 bias_name: None,
+                "merged": True,
+                "merge_kind": "non-overlapping",
             }
             merged_hit.meta.update(meta_upd)
 
         # First passage for directly mergeable hits
         hits = parent_chain.children.filter(lambda x: x.name == self.assign_name)
         splits = filter(lambda x: len(x) > 1, split_when(hits, not_directly_mergeable))
+        splits = list(splits)
         for split in splits:
+            logger.debug(f"Merging {split} for {parent_chain}")
             merged = join_non_overlapping_hits(parent_chain, split, self.assign_name)
             populate_meta(merged, split)
 
@@ -284,6 +300,47 @@ class PKDiscoverer:
         )
         for split in splits:
             join_overlapping_hits(parent_chain, split, self.assign_name, self.pyhmm)
+
+    def post_join_filter(self, chains: abc.Sequence[lxc.ChainSequence]):
+        def get_meta(c: lxc.ChainSequence, postfix: str):
+            key = f"{self.assign_name}_{postfix}"
+            try:
+                return float(c.meta[key])
+            except KeyError as e:
+                raise KeyError(f"No key {key} in {c}'s meta {c.meta}")
+
+        def accept_hit(hit: lxc.ChainSequence):
+            values = (
+                get_meta(hit, "cov_hmm"),
+                get_meta(hit, "cov_seq"),
+                get_meta(hit, "score"),
+                len(hit),
+                get_meta(hit, "pvalue"),
+            )
+            criteria = starmap(
+                lambda k, v, o: self.cfg.get(k, None) is None or o(v, self.cfg[k]),
+                zip(keys, values, ops),
+            )
+            accepted = all(criteria)
+            criteria_fmt = ",".join(
+                "{}={:.2f}".format(k, v) for k, v in zip(keys, values)
+            )
+            logger.debug(f"Criteria={criteria_fmt}. Accepted={accepted}.")
+            return accepted
+
+        def iter_accepted():
+            for c in chains:
+                accepted_hits = c.children[self.assign_name].filter(accept_hit)
+                if accepted_hits:
+                    c.children = c.children.filter(
+                        lambda x: x.name != self.assign_name or x in accepted_hits
+                    )
+                    yield c
+
+        keys = ("min_cov_hmm", "min_cov_seq", "min_score", "min_size", "max_pvalue")
+        ops = (op.ge, op.ge, op.ge, op.ge, op.lt)
+
+        return lxc.ChainList(iter_accepted())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,9 @@ from pathlib import Path
 
 import lXtractor.chain as lxc
 from lXtractor.util import read_fasta
+from loguru import logger
+
+_T = t.TypeVar("_T")
 
 
 def read_fasta_gz(p: Path):
@@ -32,11 +35,12 @@ def select_transcripts_by_meta(
 
 
 class Proteome:
-    def __init__(self, fasta_path: Path, category: str):
+    def __init__(self, fasta_path: Path):
         self.fasta_path = fasta_path
         self.file_meta: dict[str, t.Any] = self.parse_filename(fasta_path.name)
-        self.file_meta["category"] = category
         self.file_meta["filename"] = fasta_path.name
+        self.file_meta["parent_filename"] = fasta_path.parent.name
+        self._prefix = f"Proteome({fasta_path.name})"
 
     @abstractmethod
     def init_chain_sequence(self, fasta_item: tuple[str, str]) -> lxc.ChainSequence:
@@ -48,19 +52,19 @@ class Proteome:
         ...
 
     @staticmethod
-    def select_transcripts(
-        chains: abc.Iterable[lxc.ChainSequence],
-    ) -> abc.Iterator[lxc.ChainSequence]:
-        return iter(chains)
+    def select_transcripts(chains: _T) -> _T:
+        return chains
 
-    def preprocess(self) -> abc.Iterator[lxc.ChainSequence]:
+    def preprocess(self) -> lxc.ChainList[lxc.ChainSequence]:
         if self.fasta_path.name.endswith(".gz"):
             fasta_iter = read_fasta_gz(self.fasta_path)
         else:
             fasta_iter = read_fasta(self.fasta_path, strip_id=False)
-        chains = map(self.init_chain_sequence, fasta_iter)
-        chains = self.select_transcripts(chains)
-        yield from chains
+        chains = list(map(self.init_chain_sequence, fasta_iter))
+        logger.info(f"{self._prefix} initial chains = {len(chains)}")
+        chains = lxc.ChainList(self.select_transcripts(chains))
+        logger.info(f"{self._prefix} selected transcripts; chains = {len(chains)}")
+        return chains
 
 
 class EnsemblProteome(Proteome):
@@ -107,10 +111,10 @@ class NCBIProteome(Proteome):
         cs.meta.update(dict(header=header))
         return cs
 
-    def preprocess(self):
+    def preprocess(self) -> lxc.ChainList[lxc.ChainSequence]:
         chains = super().preprocess()
-        chains = filter(lambda c: "partial" in c.meta["header"], chains)
-        yield from chains
+        chains = chains.filter(lambda c: "partial" not in c.meta["header"])
+        return chains
 
 
 class Phytozome_proteome(Proteome):

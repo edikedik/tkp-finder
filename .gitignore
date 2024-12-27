@@ -5,6 +5,10 @@
 data
 !tests/data
 notebooks
+tkp_finder/resources/hmm
+results
+*.h3m
+*.h3p
 
 .idea/*
 
